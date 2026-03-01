@@ -139,70 +139,71 @@ check_all_dependencies() {
 # Install Homebrew if missing, fix PATH permanently
 install_homebrew() {
   if command -v brew >/dev/null 2>&1; then
-    echo "${GREEN}Homebrew already installed.${RESET}"
     return 0
   fi
 
-  echo "${YELLOW}Installing Homebrew...${RESET}"
-  echo "${YELLOW}This may take a few minutes. You may be prompted for your password.${RESET}"
+  echo "${YELLOW}Installing Homebrew (this may take several minutes)...${RESET}"
+  echo "${YELLOW}You may be prompted for your password once.${RESET}"
   echo ""
 
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  local rc=$?
-
-  if [[ $rc -ne 0 ]]; then
-    echo "${RED}Homebrew installation failed (exit code $rc).${RESET}"
-    echo "${YELLOW}Try manually: https://brew.sh${RESET}"
-    return 1
-  fi
+  # The brew installer is interactive — it REQUIRES pressing Enter
+  # and outputs tons of noise. We use NONINTERACTIVE=1 to skip the
+  # Enter prompt, and pipe output through a simple progress indicator.
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" 2>&1 | \
+    while IFS= read -r line; do
+      # Only show meaningful progress lines
+      if echo "$line" | grep -qiE "^==> (Installing|Downloading|Searching)"; then
+        echo "  ${CYAN}${line}${RESET}"
+      fi
+    done
 
   # Find where it installed and fix PATH
   fix_brew_path
 
   if ! command -v brew >/dev/null 2>&1; then
-    echo "${RED}Homebrew installed but not in PATH.${RESET}"
-    echo "${YELLOW}Checking common locations...${RESET}"
+    # Try harder
     for p in /opt/homebrew/bin/brew /usr/local/bin/brew; do
       if [[ -f "$p" ]]; then
-        echo "${GREEN}Found at $p${RESET}"
         eval "$("$p" shellenv)"
         break
       fi
     done
   fi
 
-  if ! command -v brew >/dev/null 2>&1; then
-    echo "${RED}FATAL: Cannot find brew after installation.${RESET}"
+  if command -v brew >/dev/null 2>&1; then
+    detect_brew_prefix
+    echo "${GREEN}✅ Homebrew installed.${RESET}"
+    return 0
+  else
+    echo "${RED}Homebrew installation failed.${RESET}"
+    echo "${YELLOW}Install manually: https://brew.sh then re-run this script.${RESET}"
     return 1
   fi
-
-  # PATH persistence handled by auto_bootstrap
-
-  detect_brew_prefix
-  echo "${GREEN}Homebrew installed and PATH configured.${RESET}"
-  return 0
 }
 
 # Install brew packages with clear reporting
 install_brew_packages() {
   if ! command -v brew >/dev/null 2>&1; then
-    echo "${RED}Cannot install packages — brew not found. Run setup first.${RESET}"
+    echo "${RED}Cannot install packages — brew not found.${RESET}"
     return 1
   fi
 
   local REQUIRED_PKGS="nginx ngrok htop tmux"
   local OPTIONAL_PKGS="macmon displayplacer"
+  local ok="${GREEN}✓${RESET}"
+  local fail="${RED}✗${RESET}"
+  local warn="${YELLOW}⚠${RESET}"
 
   echo "${YELLOW}Installing required packages...${RESET}"
   for pkg in $REQUIRED_PKGS; do
     if command -v "$pkg" >/dev/null 2>&1; then
-      echo "  ${GREEN}✓${RESET} $pkg (already installed)"
+      echo "  $ok $pkg (already installed)"
     else
-      echo "  ${YELLOW}Installing $pkg...${RESET}"
-      if brew install "$pkg" 2>&1 | tail -1; then
-        echo "  ${GREEN}✓${RESET} $pkg installed"
+      printf "  ${CYAN}Installing $pkg...${RESET}"
+      if brew install "$pkg" >/dev/null 2>&1; then
+        echo "\r  $ok $pkg installed          "
       else
-        echo "  ${RED}✗${RESET} $pkg failed to install"
+        echo "\r  $fail $pkg failed            "
       fi
     fi
   done
@@ -210,10 +211,14 @@ install_brew_packages() {
   echo "${YELLOW}Installing optional packages...${RESET}"
   for pkg in $OPTIONAL_PKGS; do
     if command -v "$pkg" >/dev/null 2>&1; then
-      echo "  ${GREEN}✓${RESET} $pkg (already installed)"
+      echo "  $ok $pkg (already installed)"
     else
-      echo "  ${YELLOW}Installing $pkg...${RESET}"
-      brew install "$pkg" 2>&1 | tail -1 || echo "  ${YELLOW}⚠${RESET} $pkg skipped (optional)"
+      printf "  ${CYAN}Installing $pkg...${RESET}"
+      if brew install "$pkg" >/dev/null 2>&1; then
+        echo "\r  $ok $pkg installed          "
+      else
+        echo "\r  $warn $pkg skipped (optional)"
+      fi
     fi
   done
 
