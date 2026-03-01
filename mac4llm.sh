@@ -424,9 +424,10 @@ FVEOF
       sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$USER" 2>/dev/null || true
 
       # Method 3: Generate /etc/kcpassword (what macOS actually reads at boot)
-      python3 -c "
+      # Pass password via stdin to avoid shell escaping issues
+      echo "$AL_PASS" | python3 -c "
 import sys
-password = sys.argv[1].encode('utf-8')
+password = sys.stdin.readline().rstrip('\n').encode('utf-8')
 key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
 padded = password + b'\x00' * (12 - len(password) % 12)
 encoded = bytearray()
@@ -434,14 +435,19 @@ for i, b in enumerate(padded):
     encoded.append(b ^ key[i % len(key)])
 with open('/tmp/kcpassword', 'wb') as f:
     f.write(bytes(encoded))
-" "$AL_PASS" 2>/dev/null
+" 2>/dev/null
 
       if [[ -f /tmp/kcpassword ]]; then
         sudo cp /tmp/kcpassword /etc/kcpassword
         sudo chmod 600 /etc/kcpassword
         sudo chown root:wheel /etc/kcpassword
         rm -f /tmp/kcpassword
+        echo "${GREEN}  kcpassword written successfully.${RESET}"
+      else
+        echo "${RED}  WARNING: kcpassword generation failed. Auto-login may not work.${RESET}"
+        echo "${YELLOW}  Run manually: sudo mac4llm.sh then Option 1 → FileVault step${RESET}"
       fi
+      
 
       # Disable screen lock (prevents SSH "System is locked" after reboot)
       sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true 2>/dev/null || true
