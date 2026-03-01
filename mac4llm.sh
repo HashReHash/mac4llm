@@ -176,19 +176,7 @@ install_homebrew() {
     return 1
   fi
 
-  # Make PATH permanent
-  local SHELL_RC="$HOME/.zshrc"
-  local BREW_LINE='eval "$(/opt/homebrew/bin/brew shellenv)"'
-  if [[ -f /usr/local/bin/brew ]]; then
-    BREW_LINE='eval "$(/usr/local/bin/brew shellenv)"'
-  fi
-
-  if ! grep -qF "brew shellenv" "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "# Homebrew PATH (added by mac4llm.sh)" >> "$SHELL_RC"
-    echo "$BREW_LINE" >> "$SHELL_RC"
-    echo "${GREEN}Added brew to $SHELL_RC${RESET}"
-  fi
+  # PATH persistence handled by auto_bootstrap
 
   detect_brew_prefix
   echo "${GREEN}Homebrew installed and PATH configured.${RESET}"
@@ -583,33 +571,36 @@ first_time_setup() {
   echo "  ${CYAN}2${RESET}) Skip"
   read -p "${YELLOW}Choose [1]: ${RESET}" HARDEN
   if [[ "${HARDEN:-1}" == "1" ]]; then
-    echo "${YELLOW}  Disabling unused services...${RESET}"
-    for svc in smbd AppleFileServer ftp netbiosd screensharing printd Siri mDNSResponder; do
-      sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple."$svc".plist 2>/dev/null || true
-    done
-    sudo launchctl disable system/com.apple.screensharing 2>/dev/null || true
-    defaults write com.apple.NetworkBrowser DisableAirDrop -bool YES
-    sudo defaults write /Library/Preferences/com.apple.Bluetooth ControllerPowerState -int 0 2>/dev/null
-    sudo launchctl stop com.apple.blued 2>/dev/null || true
+    echo "${YELLOW}  Applying hardening (this takes a moment)...${RESET}"
+    {
+      # Disable unused services
+      for svc in smbd AppleFileServer ftp netbiosd screensharing printd Siri mDNSResponder; do
+        sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple."$svc".plist 2>/dev/null || true
+      done
+      sudo launchctl disable system/com.apple.screensharing 2>/dev/null || true
+      defaults write com.apple.NetworkBrowser DisableAirDrop -bool YES
+      sudo defaults write /Library/Preferences/com.apple.Bluetooth ControllerPowerState -int 0
+      sudo launchctl stop com.apple.blued 2>/dev/null || true
 
-    echo "${YELLOW}  Configuring power management...${RESET}"
-    sudo pmset -a sleep 0 displaysleep 0 disksleep 0 autopoweroff 0 2>/dev/null
-    sudo pmset -a autorestart 1 2>/dev/null
+      # Power management
+      sudo pmset -a sleep 0 displaysleep 0 disksleep 0 autopoweroff 0
+      sudo pmset -a autorestart 1
 
-    echo "${YELLOW}  Enabling SSH...${RESET}"
-    sudo systemsetup -setremotelogin on 2>/dev/null
-    sudo systemsetup -setremoteappleevents off 2>/dev/null
+      # SSH + remote events
+      sudo systemsetup -setremotelogin on
+      sudo systemsetup -setremoteappleevents off
 
-    echo "${YELLOW}  Disabling Spotlight indexing...${RESET}"
-    sudo mdutil -i off -a 2>/dev/null
-    sudo mdutil -E -a 2>/dev/null
+      # Spotlight
+      sudo mdutil -i off -a
+      sudo mdutil -E -a
 
-    echo "${YELLOW}  Disabling screen lock (for SSH access)...${RESET}"
-    sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true
-    defaults write com.apple.screensaver askForPassword -int 0
-    defaults write com.apple.screensaver askForPasswordDelay -int 0
-    defaults -currentHost write com.apple.screensaver idleTime -int 0
-    sudo sysadminctl -screenLock off 2>/dev/null || true
+      # Screen lock
+      sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true
+      defaults write com.apple.screensaver askForPassword -int 0
+      defaults write com.apple.screensaver askForPasswordDelay -int 0
+      defaults -currentHost write com.apple.screensaver idleTime -int 0
+      sudo sysadminctl -screenLock off 2>/dev/null || true
+    } >/dev/null 2>&1
 
     step_ok "System hardened (services disabled, never-sleep, SSH on, screen lock off)"
   else
@@ -1107,7 +1098,6 @@ show_main_menu() {
       3) launch_monitor ;;
       4) check_all_dependencies; read -p "${CYAN}Press Enter...${RESET}" ;;
       5) echo "${GREEN}👋 Goodbye!${RESET}"; return 0 ;;
-      *) echo "${RED}Invalid choice.${RESET}"; sleep 1 ;;
     esac
   done
 }
@@ -1290,6 +1280,51 @@ if [[ "${1:-}" == "--alert" ]]; then
   send_extreme_alert "${2:-Server alert}"
   exit 0
 fi
+
+# ── Auto-bootstrap: ensure brew + PATH before anything ──
+auto_bootstrap() {
+  # Fix PATH first
+  fix_brew_path
+
+  # If brew still not found, install it
+  if ! command -v brew >/dev/null 2>&1; then
+    echo ""
+    echo "${YELLOW}Homebrew is not installed. It's required for this tool.${RESET}"
+    echo "${YELLOW}Installing Homebrew now...${RESET}"
+    echo ""
+    install_homebrew
+    if ! command -v brew >/dev/null 2>&1; then
+      echo ""
+      echo "${RED}FATAL: Could not install Homebrew.${RESET}"
+      echo "${RED}Please install manually: https://brew.sh${RESET}"
+      echo "${RED}Then re-run this script.${RESET}"
+      exit 1
+    fi
+  fi
+
+  # Ensure PATH is in .zshrc for future sessions
+  local SHELL_RC="$HOME/.zshrc"
+  if ! grep -qF "brew shellenv" "$SHELL_RC" 2>/dev/null; then
+    local BREW_BIN
+    BREW_BIN=$(which brew)
+    echo "" >> "$SHELL_RC"
+    echo "# Homebrew PATH (added by mac4llm.sh)" >> "$SHELL_RC"
+    echo "eval \"\$(${BREW_BIN} shellenv)\"" >> "$SHELL_RC"
+  fi
+
+  # Ensure script auto-launches on SSH login
+  local SCRIPT_PATH
+  SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  if ! grep -qF "mac4llm" "$SHELL_RC" 2>/dev/null; then
+    echo "" >> "$SHELL_RC"
+    echo "# Auto-launch LLM control panel" >> "$SHELL_RC"
+    echo "[[ -t 1 ]] && $SCRIPT_PATH" >> "$SHELL_RC"
+  fi
+
+  detect_brew_prefix
+}
+
+auto_bootstrap
 
 # ── Start ──
 show_main_menu
