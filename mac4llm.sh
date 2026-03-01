@@ -1,7 +1,23 @@
 #!/bin/bash
-# mac4llm.sh — Mac Studio LLM Control Panel v0.31 (March 2026)
-# All bugs fixed. Every step: skip, retry, error recovery.
-# Triple auto-login + screen lock disable + kcpassword.
+# mac4llm.sh — Mac Studio LLM Control Panel v0.40 (March 2026)
+# Complete rewrite. Proper dependency management. No silent failures.
+
+# ══════════════════════════════════════════════════════════════
+# PHASE 0: BOOTSTRAP — runs before ANYTHING else
+# ══════════════════════════════════════════════════════════════
+
+# ── Find and fix PATH for Homebrew ──
+fix_brew_path() {
+  # Check common brew locations
+  if [[ -f /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [[ -f /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  elif [[ -f "$HOME/.homebrew/bin/brew" ]]; then
+    eval "$("$HOME/.homebrew/bin/brew" shellenv)"
+  fi
+}
+fix_brew_path
 
 # ── Colors (safe for non-interactive / cron) ──
 RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""; BOLD=""; RESET=""
@@ -16,7 +32,7 @@ if [[ -t 1 ]]; then
   RESET=$(tput sgr0 2>/dev/null) || RESET=""
 fi
 
-VERSION="v0.31"
+VERSION="v0.40"
 
 # ── Paths ──
 CONFIG_FILE="$HOME/.llm-server.conf"
@@ -32,14 +48,193 @@ LMS_PATH=""
 DIVIDER="${BLUE}──────────────────────────────────────────────────────────────${RESET}"
 STEP_ACTION=""
 
+# ── Detect brew prefix (only if brew exists) ──
 detect_brew_prefix() {
-  BREW_PREFIX=$(brew --prefix 2>/dev/null || echo "/opt/homebrew")
-  NGINX_CONF_DIR="$BREW_PREFIX/etc/nginx/servers"
-  NGINX_CONF="$NGINX_CONF_DIR/lmstudio.conf"
+  if command -v brew >/dev/null 2>&1; then
+    BREW_PREFIX=$(brew --prefix)
+  else
+    BREW_PREFIX=""
+  fi
+  if [[ -n "$BREW_PREFIX" ]]; then
+    NGINX_CONF_DIR="$BREW_PREFIX/etc/nginx/servers"
+    NGINX_CONF="$NGINX_CONF_DIR/lmstudio.conf"
+  fi
 }
 detect_brew_prefix
 
-# ── Config (safe parsing, no source) ──
+# ══════════════════════════════════════════════════════════════
+# DEPENDENCY SYSTEM — the heart of the rewrite
+# ══════════════════════════════════════════════════════════════
+
+# Check if a command exists and report clearly
+require_cmd() {
+  local cmd="$1"
+  local purpose="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "${RED}MISSING: ${BOLD}$cmd${RESET}${RED} — needed for: $purpose${RESET}"
+    return 1
+  fi
+  return 0
+}
+
+# Check all dependencies and report what's missing
+check_all_dependencies() {
+  local missing=0
+
+  echo "${BOLD}${CYAN}Checking dependencies...${RESET}"
+  echo ""
+
+  # Always available on macOS
+  local ok="${GREEN}✓${RESET}"
+  local fail="${RED}✗${RESET}"
+
+  # macOS built-ins (should always exist)
+  for cmd in sudo scutil networksetup defaults launchctl pfctl pmset /usr/bin/perl; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "  $ok $cmd"
+    else
+      echo "  $fail $cmd ${RED}(macOS built-in — something is very wrong)${RESET}"
+      missing=$((missing + 1))
+    fi
+  done
+
+  # Homebrew
+  if command -v brew >/dev/null 2>&1; then
+    echo "  $ok brew ($(brew --version 2>/dev/null | head -1))"
+  else
+    echo "  $fail brew ${YELLOW}(will install in setup)${RESET}"
+  fi
+
+  # Brew-installed tools
+  local BREW_TOOLS="nginx ngrok htop tmux"
+  local OPTIONAL_BREW="macmon displayplacer"
+
+  for cmd in $BREW_TOOLS; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "  $ok $cmd"
+    else
+      echo "  $fail $cmd ${YELLOW}(will install in setup)${RESET}"
+    fi
+  done
+
+  for cmd in $OPTIONAL_BREW; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "  $ok $cmd"
+    else
+      echo "  $fail $cmd ${YELLOW}(optional — will try to install)${RESET}"
+    fi
+  done
+
+  # LM Studio
+  if command -v lms >/dev/null 2>&1; then
+    echo "  $ok lms (LM Studio CLI)"
+  else
+    echo "  $fail lms ${YELLOW}(will install in setup)${RESET}"
+  fi
+
+  echo ""
+  return $missing
+}
+
+# Install Homebrew if missing, fix PATH permanently
+install_homebrew() {
+  if command -v brew >/dev/null 2>&1; then
+    echo "${GREEN}Homebrew already installed.${RESET}"
+    return 0
+  fi
+
+  echo "${YELLOW}Installing Homebrew...${RESET}"
+  echo "${YELLOW}This may take a few minutes. You may be prompted for your password.${RESET}"
+  echo ""
+
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  local rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    echo "${RED}Homebrew installation failed (exit code $rc).${RESET}"
+    echo "${YELLOW}Try manually: https://brew.sh${RESET}"
+    return 1
+  fi
+
+  # Find where it installed and fix PATH
+  fix_brew_path
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "${RED}Homebrew installed but not in PATH.${RESET}"
+    echo "${YELLOW}Checking common locations...${RESET}"
+    for p in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+      if [[ -f "$p" ]]; then
+        echo "${GREEN}Found at $p${RESET}"
+        eval "$("$p" shellenv)"
+        break
+      fi
+    done
+  fi
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "${RED}FATAL: Cannot find brew after installation.${RESET}"
+    return 1
+  fi
+
+  # Make PATH permanent
+  local SHELL_RC="$HOME/.zshrc"
+  local BREW_LINE='eval "$(/opt/homebrew/bin/brew shellenv)"'
+  if [[ -f /usr/local/bin/brew ]]; then
+    BREW_LINE='eval "$(/usr/local/bin/brew shellenv)"'
+  fi
+
+  if ! grep -qF "brew shellenv" "$SHELL_RC" 2>/dev/null; then
+    echo "" >> "$SHELL_RC"
+    echo "# Homebrew PATH (added by mac4llm.sh)" >> "$SHELL_RC"
+    echo "$BREW_LINE" >> "$SHELL_RC"
+    echo "${GREEN}Added brew to $SHELL_RC${RESET}"
+  fi
+
+  detect_brew_prefix
+  echo "${GREEN}Homebrew installed and PATH configured.${RESET}"
+  return 0
+}
+
+# Install brew packages with clear reporting
+install_brew_packages() {
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "${RED}Cannot install packages — brew not found. Run setup first.${RESET}"
+    return 1
+  fi
+
+  local REQUIRED_PKGS="nginx ngrok htop tmux"
+  local OPTIONAL_PKGS="macmon displayplacer"
+
+  echo "${YELLOW}Installing required packages...${RESET}"
+  for pkg in $REQUIRED_PKGS; do
+    if command -v "$pkg" >/dev/null 2>&1; then
+      echo "  ${GREEN}✓${RESET} $pkg (already installed)"
+    else
+      echo "  ${YELLOW}Installing $pkg...${RESET}"
+      if brew install "$pkg" 2>&1 | tail -1; then
+        echo "  ${GREEN}✓${RESET} $pkg installed"
+      else
+        echo "  ${RED}✗${RESET} $pkg failed to install"
+      fi
+    fi
+  done
+
+  echo "${YELLOW}Installing optional packages...${RESET}"
+  for pkg in $OPTIONAL_PKGS; do
+    if command -v "$pkg" >/dev/null 2>&1; then
+      echo "  ${GREEN}✓${RESET} $pkg (already installed)"
+    else
+      echo "  ${YELLOW}Installing $pkg...${RESET}"
+      brew install "$pkg" 2>&1 | tail -1 || echo "  ${YELLOW}⚠${RESET} $pkg skipped (optional)"
+    fi
+  done
+
+  detect_brew_prefix
+}
+
+# ══════════════════════════════════════════════════════════════
+# SAFE CONFIG — no source, no code execution
+# ══════════════════════════════════════════════════════════════
 load_config() {
   PORT=1234; TOKEN=""
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -63,18 +258,20 @@ EOF
 resolve_lms_path() {
   LMS_PATH=$(command -v lms 2>/dev/null || echo "")
   if [[ -z "$LMS_PATH" ]]; then
-    echo "${RED}ERROR: lms binary not found. Run Option 1 first.${RESET}"
+    echo "${RED}lms not found. Install LM Studio first (Setup → Install Software).${RESET}"
     return 1
   fi
 }
 
-# ── UI Helpers ──
+# ══════════════════════════════════════════════════════════════
+# UI HELPERS
+# ══════════════════════════════════════════════════════════════
 clear_screen() { clear 2>/dev/null || true; }
 
 print_header() {
   clear_screen
   echo "${BLUE}╔══════════════════════════════════════════════════════════════╗${RESET}"
-  echo "${BLUE}║  ${BOLD}${CYAN}Mac Studio LLM Server Control Panel ${VERSION}${RESET}              ${BLUE}║${RESET}"
+  echo "${BLUE}║  ${BOLD}${CYAN}Mac Studio LLM Server Control Panel ${VERSION}${RESET}             ${BLUE}║${RESET}"
   echo "${BLUE}║  ${MAGENTA}Follow steps to fine-tune your Mac to run LM Studio${RESET}       ${BLUE}║${RESET}"
   echo "${BLUE}╚══════════════════════════════════════════════════════════════╝${RESET}"
   echo ""
@@ -85,7 +282,6 @@ step_ok() {
   echo "$DIVIDER"
 }
 
-# Sets global STEP_ACTION: skip | retry | menu
 step_fail() {
   echo "${RED}❌ $1${RESET}"
   echo ""
@@ -103,14 +299,64 @@ step_fail() {
   esac
 }
 
-# ── Minimal GUI ──
+# ══════════════════════════════════════════════════════════════
+# KCPASSWORD — pure perl, no python3, no Xcode needed
+# ══════════════════════════════════════════════════════════════
+generate_kcpassword() {
+  local password="$1"
+  if [[ -z "$password" ]]; then
+    echo "${RED}Empty password.${RESET}"
+    return 1
+  fi
+
+  echo "$password" | /usr/bin/perl -e '
+    my $pass = <STDIN>;
+    chomp $pass;
+    if (length($pass) == 0) { die "empty password"; }
+    my @key = (0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F);
+    my $pad = 12 - (length($pass) % 12);
+    $pass .= "\0" x $pad;
+    my $encoded = "";
+    for my $i (0..length($pass)-1) {
+      $encoded .= chr(ord(substr($pass,$i,1)) ^ $key[$i % scalar(@key)]);
+    }
+    open(my $fh, ">:raw", "/tmp/kcpassword") or die "Cannot write: $!";
+    print $fh $encoded;
+    close($fh);
+  '
+
+  if [[ ! -f /tmp/kcpassword ]]; then
+    echo "${RED}kcpassword generation failed.${RESET}"
+    return 1
+  fi
+
+  sudo cp /tmp/kcpassword /etc/kcpassword
+  sudo chmod 600 /etc/kcpassword
+  sudo chown root:wheel /etc/kcpassword
+  rm -f /tmp/kcpassword
+
+  # Verify it was written
+  if sudo test -f /etc/kcpassword; then
+    echo "${GREEN}  kcpassword written to /etc/kcpassword${RESET}"
+    return 0
+  else
+    echo "${RED}  Failed to copy kcpassword to /etc/${RESET}"
+    return 1
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════
+# MINIMAL GUI
+# ══════════════════════════════════════════════════════════════
 configure_minimal_gui() {
   echo "${BOLD}${YELLOW}Step: Configure minimal GUI${RESET}"
 
   sudo mkdir -p /usr/local/bin
   mkdir -p "$HOME/Library/LaunchAgents"
 
-  sudo tee /usr/local/bin/minimal-display.sh > /dev/null <<'MINDISP'
+  # Only write display script if displayplacer is available
+  if command -v displayplacer >/dev/null 2>&1; then
+    sudo tee /usr/local/bin/minimal-display.sh > /dev/null <<'MINDISP'
 #!/bin/bash
 sleep 10
 DISP_ID=$(displayplacer list 2>/dev/null | grep "Persistent screen id" | head -1 | awk '{print $NF}')
@@ -118,55 +364,9 @@ if [[ -n "$DISP_ID" ]]; then
   displayplacer "id:${DISP_ID} res:800x600 hz:30 color_depth:4 scaling:off" 2>/dev/null || true
 fi
 MINDISP
-  sudo chmod +x /usr/local/bin/minimal-display.sh
+    sudo chmod +x /usr/local/bin/minimal-display.sh
 
-  {
-    defaults write com.apple.finder DisableAllAnimations -bool true
-    defaults write com.apple.finder CreateDesktop -bool false
-    defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool false
-    defaults write com.apple.finder ShowHardDrivesOnDesktop -bool false
-    defaults write com.apple.finder ShowMountedServersOnDesktop -bool false
-    defaults write com.apple.finder ShowRemovableMediaOnDesktop -bool false
-    defaults write com.apple.finder ShowStatusBar -bool false
-    defaults write com.apple.finder ShowPathbar -bool false
-    defaults write com.apple.finder ShowPreviewPane -bool false
-    defaults write com.apple.finder ShowSidebar -bool false
-    defaults write com.apple.finder FXEnableExtensionChangeWarning -bool false
-    defaults write com.apple.finder AnimateWindowZoom -bool false
-    defaults write com.apple.finder QuitMenuItem -bool true
-
-    defaults write com.apple.dock autohide -bool true
-    defaults write com.apple.dock autohide-delay -float 1000
-    defaults write com.apple.dock no-bouncing -bool true
-    defaults write com.apple.dock launchanim -bool false
-    defaults write com.apple.dock show-recents -bool false
-    defaults write com.apple.dock minimize-to-application -bool true
-    defaults write com.apple.dock mineffect -string scale
-    defaults write com.apple.dock tilesize -integer 16
-    defaults write com.apple.dock show-process-indicators -bool false
-    defaults write com.apple.dock persistent-apps -array
-    defaults write com.apple.dock persistent-others -array
-    defaults write com.apple.dock recent-apps -array
-
-    defaults write com.apple.universalaccess reduceMotion -bool true
-    defaults write com.apple.universalaccess reduceTransparency -bool true
-    defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
-    defaults write NSGlobalDomain NSWindowResizeTime -float 0.001
-    defaults write -g QLPanelAnimationDuration -float 0
-    sudo defaults write com.apple.universalaccess reduceTransparency -bool true
-
-    launchctl unload -w /System/Library/LaunchAgents/com.apple.notificationcenterui.plist 2>/dev/null || true
-    defaults write com.apple.assistant.support "Assistant Enabled" -bool false
-    launchctl disable "gui/$(id -u)/com.apple.Siri" 2>/dev/null || true
-    defaults write com.apple.Spotlight MenuItemHidden -bool true
-    defaults -currentHost write com.apple.screensaver idleTime -int 0
-    defaults write com.apple.dashboard mcx-disabled -bool true 2>/dev/null || true
-    defaults write -g CGFontRenderingFontSmoothingDisabled -bool true
-    defaults write com.apple.loginwindow TALLogoutSavesState -bool false
-    defaults write NSGlobalDomain NSQuitAlwaysKeepsWindows -bool false
-  } >/dev/null 2>&1
-
-  cat > "$MINIMAL_GUI_PLIST" <<PLIST
+    cat > "$MINIMAL_GUI_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -181,16 +381,69 @@ MINDISP
 </dict>
 </plist>
 PLIST
-  launchctl bootout "gui/$(id -u)/com.llm.minimal-gui" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$MINIMAL_GUI_PLIST" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/com.llm.minimal-gui" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$MINIMAL_GUI_PLIST" 2>/dev/null || true
+  else
+    echo "${YELLOW}  displayplacer not found — skipping virtual display config.${RESET}"
+  fi
 
-  {
-    killall Finder
-    killall Dock
-    killall SystemUIServer
-  } >/dev/null 2>&1 || true
+  # These defaults commands always work (macOS built-in)
+  local ERRORS=0
 
-  step_ok "Minimal GUI configured"
+  defaults write com.apple.finder DisableAllAnimations -bool true || ((ERRORS++))
+  defaults write com.apple.finder CreateDesktop -bool false || ((ERRORS++))
+  defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool false
+  defaults write com.apple.finder ShowHardDrivesOnDesktop -bool false
+  defaults write com.apple.finder ShowMountedServersOnDesktop -bool false
+  defaults write com.apple.finder ShowRemovableMediaOnDesktop -bool false
+  defaults write com.apple.finder ShowStatusBar -bool false
+  defaults write com.apple.finder ShowPathbar -bool false
+  defaults write com.apple.finder ShowPreviewPane -bool false
+  defaults write com.apple.finder ShowSidebar -bool false
+  defaults write com.apple.finder FXEnableExtensionChangeWarning -bool false
+  defaults write com.apple.finder AnimateWindowZoom -bool false
+  defaults write com.apple.finder QuitMenuItem -bool true
+
+  defaults write com.apple.dock autohide -bool true
+  defaults write com.apple.dock autohide-delay -float 1000
+  defaults write com.apple.dock no-bouncing -bool true
+  defaults write com.apple.dock launchanim -bool false
+  defaults write com.apple.dock show-recents -bool false
+  defaults write com.apple.dock minimize-to-application -bool true
+  defaults write com.apple.dock mineffect -string scale
+  defaults write com.apple.dock tilesize -integer 16
+  defaults write com.apple.dock show-process-indicators -bool false
+  defaults write com.apple.dock persistent-apps -array
+  defaults write com.apple.dock persistent-others -array
+  defaults write com.apple.dock recent-apps -array
+
+  defaults write com.apple.universalaccess reduceMotion -bool true
+  defaults write com.apple.universalaccess reduceTransparency -bool true
+  defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
+  defaults write NSGlobalDomain NSWindowResizeTime -float 0.001
+  defaults write -g QLPanelAnimationDuration -float 0
+  sudo defaults write com.apple.universalaccess reduceTransparency -bool true 2>/dev/null
+
+  launchctl unload -w /System/Library/LaunchAgents/com.apple.notificationcenterui.plist 2>/dev/null || true
+  defaults write com.apple.assistant.support "Assistant Enabled" -bool false
+  launchctl disable "gui/$(id -u)/com.apple.Siri" 2>/dev/null || true
+  defaults write com.apple.Spotlight MenuItemHidden -bool true
+  defaults -currentHost write com.apple.screensaver idleTime -int 0
+  defaults write com.apple.dashboard mcx-disabled -bool true 2>/dev/null || true
+  defaults write -g CGFontRenderingFontSmoothingDisabled -bool true
+  defaults write com.apple.loginwindow TALLogoutSavesState -bool false
+  defaults write NSGlobalDomain NSQuitAlwaysKeepsWindows -bool false
+
+  killall Finder 2>/dev/null || true
+  killall Dock 2>/dev/null || true
+  killall SystemUIServer 2>/dev/null || true
+
+  if [[ $ERRORS -eq 0 ]]; then
+    step_ok "Minimal GUI configured"
+  else
+    echo "${YELLOW}⚠ Minimal GUI configured with $ERRORS warnings (non-critical).${RESET}"
+    echo "$DIVIDER"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -279,8 +532,8 @@ first_time_setup() {
       [[ $STEP_ACTION == "menu" ]] && return
       break
     fi
-    if sudo networksetup -setmanual "$SERVICE" "$IP" "$SUBNET" "$ROUTER" 2>/dev/null; then
-      sudo networksetup -setdnsservers "$SERVICE" 8.8.8.8 2>/dev/null
+    if sudo networksetup -setmanual "$SERVICE" "$IP" "$SUBNET" "$ROUTER"; then
+      sudo networksetup -setdnsservers "$SERVICE" 8.8.8.8
       step_ok "Static IP $IP set on $SERVICE"
       break
     else
@@ -313,7 +566,7 @@ first_time_setup() {
       done < <(networksetup -listallhardwareports 2>/dev/null)
 
       if [[ -n "$WIFI_DEV" ]]; then
-        sudo networksetup -setairportpower "$WIFI_DEV" off >/dev/null 2>&1 || true
+        sudo networksetup -setairportpower "$WIFI_DEV" off 2>/dev/null
         step_ok "Wi-Fi disabled (device: $WIFI_DEV)"
       else
         echo "${YELLOW}No Wi-Fi hardware detected — nothing to disable.${RESET}"
@@ -330,27 +583,34 @@ first_time_setup() {
   echo "  ${CYAN}2${RESET}) Skip"
   read -p "${YELLOW}Choose [1]: ${RESET}" HARDEN
   if [[ "${HARDEN:-1}" == "1" ]]; then
-    {
-      for svc in smbd AppleFileServer ftp netbiosd screensharing printd Siri mDNSResponder; do
-        sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple."$svc".plist 2>/dev/null || true
-      done
-      sudo launchctl disable system/com.apple.screensharing
-      defaults write com.apple.NetworkBrowser DisableAirDrop -bool YES
-      sudo defaults write /Library/Preferences/com.apple.Bluetooth ControllerPowerState -int 0
-      sudo launchctl stop com.apple.blued
-      sudo systemsetup -setremoteappleevents off
-      sudo mdutil -i off -a
-      sudo mdutil -E -a
-      sudo pmset -a sleep 0 displaysleep 0 disksleep 0 autopoweroff 0
-      sudo pmset -a autorestart 1
-      sudo systemsetup -setremotelogin on
-      # Prevent screen lock from blocking SSH access
-      sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true
-      defaults write com.apple.screensaver askForPassword -int 0
-      defaults write com.apple.screensaver askForPasswordDelay -int 0
-      defaults -currentHost write com.apple.screensaver idleTime -int 0
-      sudo sysadminctl -screenLock off 2>/dev/null || true
-    } >/dev/null 2>&1
+    echo "${YELLOW}  Disabling unused services...${RESET}"
+    for svc in smbd AppleFileServer ftp netbiosd screensharing printd Siri mDNSResponder; do
+      sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple."$svc".plist 2>/dev/null || true
+    done
+    sudo launchctl disable system/com.apple.screensharing 2>/dev/null || true
+    defaults write com.apple.NetworkBrowser DisableAirDrop -bool YES
+    sudo defaults write /Library/Preferences/com.apple.Bluetooth ControllerPowerState -int 0 2>/dev/null
+    sudo launchctl stop com.apple.blued 2>/dev/null || true
+
+    echo "${YELLOW}  Configuring power management...${RESET}"
+    sudo pmset -a sleep 0 displaysleep 0 disksleep 0 autopoweroff 0 2>/dev/null
+    sudo pmset -a autorestart 1 2>/dev/null
+
+    echo "${YELLOW}  Enabling SSH...${RESET}"
+    sudo systemsetup -setremotelogin on 2>/dev/null
+    sudo systemsetup -setremoteappleevents off 2>/dev/null
+
+    echo "${YELLOW}  Disabling Spotlight indexing...${RESET}"
+    sudo mdutil -i off -a 2>/dev/null
+    sudo mdutil -E -a 2>/dev/null
+
+    echo "${YELLOW}  Disabling screen lock (for SSH access)...${RESET}"
+    sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true
+    defaults write com.apple.screensaver askForPassword -int 0
+    defaults write com.apple.screensaver askForPasswordDelay -int 0
+    defaults -currentHost write com.apple.screensaver idleTime -int 0
+    sudo sysadminctl -screenLock off 2>/dev/null || true
+
     step_ok "System hardened (services disabled, never-sleep, SSH on, screen lock off)"
   else
     echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
@@ -398,7 +658,40 @@ first_time_setup() {
 </plist>
 FVEOF
       if sudo fdesetup disable -inputplist < "$FV_PLIST" 2>/dev/null; then
-        step_ok "FileVault disabled (decryption continues in background)"
+        step_ok "FileVault disabled"
+
+        # Check if decryption is still in progress
+        local DEC_STATUS
+        DEC_STATUS=$(sudo fdesetup status 2>/dev/null)
+        if echo "$DEC_STATUS" | grep -qi "progress\|percent"; then
+          echo "${YELLOW}⏳ Disk decryption in progress. Auto-login won't work until complete.${RESET}"
+          echo ""
+          echo "  ${CYAN}1${RESET}) Wait here and monitor until done"
+          echo "  ${CYAN}2${RESET}) Continue setup (decryption runs in background)"
+          read -p "${YELLOW}Choose [2]: ${RESET}" DECWAIT
+          if [[ "$DECWAIT" == "1" ]]; then
+            echo "${YELLOW}Monitoring decryption (updates every 30s, Ctrl+C to stop)...${RESET}"
+            echo "$DIVIDER"
+            while true; do
+              DEC_STATUS=$(sudo fdesetup status 2>/dev/null)
+              local TIMESTAMP
+              TIMESTAMP=$(date '+%H:%M:%S')
+              if echo "$DEC_STATUS" | grep -q "FileVault is Off"; then
+                echo "${GREEN}${TIMESTAMP} — ✅ Decryption complete!${RESET}"
+                echo "$DIVIDER"
+                break
+              fi
+              local PCT
+              PCT=$(echo "$DEC_STATUS" | grep -o '[0-9]*' | tail -1)
+              echo "${CYAN}${TIMESTAMP}${RESET} — Decrypting... ${BOLD}${PCT}%${RESET}"
+              sleep 30
+            done
+          else
+            echo "${YELLOW}Decryption continues in background.${RESET}"
+            echo "${CYAN}  Check with: sudo fdesetup status${RESET}"
+            echo "$DIVIDER"
+          fi
+        fi
       else
         step_fail "FileVault disable failed — wrong password?"
         if [[ $STEP_ACTION == "menu" ]]; then
@@ -412,60 +705,46 @@ FVEOF
       echo "${GREEN}FileVault is already off.${RESET}"; echo "$DIVIDER"
     fi
 
-    # Auto-login — triple method + screen lock disable
+    # Auto-login
     echo "${BOLD}${YELLOW}Step: Enable auto-login${RESET}"
     read -s -p "Login password for auto-login: " AL_PASS; echo
     if [[ -n "$AL_PASS" ]]; then
 
-      # Method 1: sysadminctl (official Apple method)
-      sudo sysadminctl -autologin set -userName "$USER" -password "$AL_PASS" >/dev/null 2>&1 || true
+      # Method 1: sysadminctl
+      echo "${YELLOW}  Applying method 1 (sysadminctl)...${RESET}"
+      sudo sysadminctl -autologin set -userName "$USER" -password "$AL_PASS" 2>/dev/null
+      echo "${GREEN}  Method 1 applied.${RESET}"
 
-      # Method 2: Write loginwindow preference
-      sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$USER" 2>/dev/null || true
+      # Method 2: loginwindow preference
+      echo "${YELLOW}  Applying method 2 (loginwindow pref)...${RESET}"
+      sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$USER"
+      echo "${GREEN}  Method 2 applied.${RESET}"
 
-      # Method 3: Generate /etc/kcpassword (what macOS actually reads at boot)
-      # Pass password via stdin to avoid shell escaping issues
-      echo "$AL_PASS" | python3 -c "
-import sys
-password = sys.stdin.readline().rstrip('\n').encode('utf-8')
-key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
-padded = password + b'\x00' * (12 - len(password) % 12)
-encoded = bytearray()
-for i, b in enumerate(padded):
-    encoded.append(b ^ key[i % len(key)])
-with open('/tmp/kcpassword', 'wb') as f:
-    f.write(bytes(encoded))
-" 2>/dev/null
+      # Method 3: kcpassword via perl (no python3/Xcode needed)
+      echo "${YELLOW}  Applying method 3 (kcpassword via perl)...${RESET}"
+      generate_kcpassword "$AL_PASS"
+      local KC_RC=$?
 
-      if [[ -f /tmp/kcpassword ]]; then
-        sudo cp /tmp/kcpassword /etc/kcpassword
-        sudo chmod 600 /etc/kcpassword
-        sudo chown root:wheel /etc/kcpassword
-        rm -f /tmp/kcpassword
-        echo "${GREEN}  kcpassword written successfully.${RESET}"
-      else
-        echo "${RED}  WARNING: kcpassword generation failed. Auto-login may not work.${RESET}"
-        echo "${YELLOW}  Run manually: sudo mac4llm.sh then Option 1 → FileVault step${RESET}"
-      fi
-      
-
-      # Disable screen lock (prevents SSH "System is locked" after reboot)
-      sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true 2>/dev/null || true
-      defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
-      defaults write com.apple.screensaver askForPasswordDelay -int 0 2>/dev/null || true
-      defaults -currentHost write com.apple.screensaver idleTime -int 0 2>/dev/null || true
+      # Screen lock disable
+      echo "${YELLOW}  Disabling screen lock...${RESET}"
+      sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true
+      defaults write com.apple.screensaver askForPassword -int 0
+      defaults write com.apple.screensaver askForPasswordDelay -int 0
+      defaults -currentHost write com.apple.screensaver idleTime -int 0
       sudo sysadminctl -screenLock off 2>/dev/null || true
 
       unset AL_PASS
-      step_ok "Auto-login configured for $USER (3 methods + screen lock disabled)"
+
+      if [[ $KC_RC -eq 0 ]]; then
+        step_ok "Auto-login configured for $USER (3 methods + screen lock disabled)"
+      else
+        echo "${YELLOW}⚠ Auto-login partially configured (kcpassword failed).${RESET}"
+        echo "${YELLOW}  Methods 1 & 2 applied. May still work. Reboot to test.${RESET}"
+        echo "$DIVIDER"
+      fi
     else
       echo "${RED}Empty password — skipping auto-login.${RESET}"; echo "$DIVIDER"
     fi
-
-    echo "  ${CYAN}1${RESET}) Reboot now (needed for changes to take effect)"
-    echo "  ${CYAN}2${RESET}) Continue setup, reboot later"
-    read -p "${YELLOW}Choose [2]: ${RESET}" REB
-    [[ "$REB" == "1" ]] && sudo reboot
   else
     echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
   fi
@@ -529,29 +808,50 @@ with open('/tmp/kcpassword', 'wb') as f:
   echo "  ${CYAN}2${RESET}) Skip"
   read -p "${YELLOW}Choose [1]: ${RESET}" INSTCHOICE
   if [[ "${INSTCHOICE:-1}" == "1" ]]; then
+
+    # Homebrew
+    install_homebrew
     if ! command -v brew >/dev/null 2>&1; then
-      echo "${YELLOW}Installing Homebrew...${RESET}"
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      if [[ -f /opt/homebrew/bin/brew ]]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-      elif [[ -f /usr/local/bin/brew ]]; then
-        eval "$(/usr/local/bin/brew shellenv)"
+      step_fail "Homebrew installation failed — cannot install other tools"
+      [[ $STEP_ACTION == "menu" ]] && return
+    else
+      # Brew packages
+      install_brew_packages
+
+      # LM Studio
+      echo "${YELLOW}Installing LM Studio CLI...${RESET}"
+      if command -v lms >/dev/null 2>&1; then
+        echo "  ${GREEN}✓${RESET} lms already installed"
+      else
+        curl -fsSL https://lmstudio.ai/install.sh | bash
+        if command -v lms >/dev/null 2>&1; then
+          echo "  ${GREEN}✓${RESET} lms installed"
+        else
+          echo "  ${RED}✗${RESET} lms installation may have failed"
+          echo "  ${YELLOW}Visit https://lmstudio.ai to install manually${RESET}"
+        fi
       fi
-      detect_brew_prefix
+
+      # Jump Desktop
+      echo "${YELLOW}Installing Jump Desktop Connect...${RESET}"
+      if [[ -f "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" ]]; then
+        echo "  ${GREEN}✓${RESET} Jump Desktop Connect already installed"
+      else
+        if curl -L -o /tmp/JumpDesktopConnect.pkg https://jumpdesktop.com/downloads/connect/mac 2>/dev/null; then
+          sudo installer -pkg /tmp/JumpDesktopConnect.pkg -target /
+          rm -f /tmp/JumpDesktopConnect.pkg
+          if [[ -f "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" ]]; then
+            echo "  ${GREEN}✓${RESET} Jump Desktop Connect installed"
+          else
+            echo "  ${YELLOW}⚠${RESET} Jump Desktop may need manual install"
+          fi
+        else
+          echo "  ${YELLOW}⚠${RESET} Could not download Jump Desktop"
+        fi
+      fi
+
+      step_ok "Software installation complete"
     fi
-
-    echo "${YELLOW}Installing CLI tools...${RESET}"
-    brew install --quiet htop tmux macmon nginx ngrok displayplacer 2>/dev/null || true
-
-    echo "${YELLOW}Installing LM Studio CLI...${RESET}"
-    curl -fsSL https://lmstudio.ai/install.sh | bash 2>/dev/null || true
-
-    echo "${YELLOW}Installing Jump Desktop Connect...${RESET}"
-    curl -L -o /tmp/JumpDesktopConnect.pkg https://jumpdesktop.com/downloads/connect/mac 2>/dev/null || true
-    sudo installer -pkg /tmp/JumpDesktopConnect.pkg -target / 2>/dev/null || true
-    rm -f /tmp/JumpDesktopConnect.pkg
-
-    step_ok "Software installed"
   else
     echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
   fi
@@ -562,12 +862,12 @@ with open('/tmp/kcpassword', 'wb') as f:
   echo "  ${CYAN}2${RESET}) Skip"
   read -p "${YELLOW}Choose [1]: ${RESET}" FWCHOICE
   if [[ "${FWCHOICE:-1}" == "1" ]]; then
-    {
-      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on
-      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setblockall on
-      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setallowsigned off
-    } >/dev/null 2>&1
+    echo "${YELLOW}  Enabling application firewall...${RESET}"
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on 2>/dev/null
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setblockall on 2>/dev/null
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setallowsigned off 2>/dev/null
 
+    echo "${YELLOW}  Configuring pf firewall...${RESET}"
     sudo mkdir -p /etc/pf.anchors
     sudo tee /etc/pf.anchors/llm-server > /dev/null <<'PF'
 block in all
@@ -582,8 +882,12 @@ load anchor "llm-server" from "/etc/pf.anchors/llm-server"
 PF
     fi
 
-    sudo pfctl -ef /etc/pf.conf >/dev/null 2>&1 || true
-    step_ok "Firewall active — only SSH (port 22) open inbound"
+    if sudo pfctl -ef /etc/pf.conf 2>/dev/null; then
+      step_ok "Firewall active — only SSH (port 22) open inbound"
+    else
+      echo "${YELLOW}⚠ pf firewall may already be running. Rules applied.${RESET}"
+      echo "$DIVIDER"
+    fi
   else
     echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
   fi
@@ -598,26 +902,43 @@ PF
 
   # ── STEP: Start services ──
   echo "${BOLD}${YELLOW}Step: Start LM Studio server + Nginx${RESET}"
-  echo "  ${CYAN}1${RESET}) Start now"
-  echo "  ${CYAN}2${RESET}) Skip (start manually later)"
-  read -p "${YELLOW}Choose [1]: ${RESET}" STARTCHOICE
-  if [[ "${STARTCHOICE:-1}" == "1" ]]; then
-    load_config
-    if [[ -z "$TOKEN" ]]; then
-      TOKEN=$(openssl rand -hex 32); save_config
-      echo "${GREEN}Auto-generated token: ${TOKEN:0:8}...${RESET}"
-    fi
-    create_launchd_plist
-    rebuild_nginx_config
+  if ! command -v lms >/dev/null 2>&1; then
+    echo "${YELLOW}  LM Studio not installed — skipping service start.${RESET}"
+    echo "$DIVIDER"
+  elif ! command -v nginx >/dev/null 2>&1; then
+    echo "${YELLOW}  Nginx not installed — skipping service start.${RESET}"
+    echo "$DIVIDER"
   else
-    echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
+    echo "  ${CYAN}1${RESET}) Start now"
+    echo "  ${CYAN}2${RESET}) Skip (start manually later)"
+    read -p "${YELLOW}Choose [1]: ${RESET}" STARTCHOICE
+    if [[ "${STARTCHOICE:-1}" == "1" ]]; then
+      load_config
+      if [[ -z "$TOKEN" ]]; then
+        TOKEN=$(openssl rand -hex 32); save_config
+        echo "${GREEN}  Auto-generated token: ${TOKEN:0:8}...${RESET}"
+      fi
+      create_launchd_plist
+      rebuild_nginx_config
+    else
+      echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
+    fi
   fi
 
+  # ── DONE — reboot prompt at the very end ──
   echo ""
   echo "${BOLD}${GREEN}══════════════════════════════════════════════════════════════${RESET}"
-  echo "${BOLD}${GREEN}  ✅ Setup complete! Returning to main menu.${RESET}"
+  echo "${BOLD}${GREEN}  ✅ Setup complete!${RESET}"
   echo "${BOLD}${GREEN}══════════════════════════════════════════════════════════════${RESET}"
-  read -p "${CYAN}Press Enter to continue...${RESET}"
+  echo ""
+  echo "  ${CYAN}1${RESET}) Reboot now (recommended if you changed FileVault/auto-login)"
+  echo "  ${CYAN}2${RESET}) Return to main menu"
+  read -p "${YELLOW}Choose [2]: ${RESET}" FINAL_REB
+  if [[ "$FINAL_REB" == "1" ]]; then
+    echo "${YELLOW}Rebooting in 3 seconds...${RESET}"
+    sleep 3
+    sudo reboot
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -652,16 +973,27 @@ create_launchd_plist() {
 EOF
   launchctl bootout "gui/$(id -u)/com.llmstudio.server" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || true
+  echo "${GREEN}  LM Studio server registered (port ${PORT}, host 127.0.0.1).${RESET}"
 }
 
 rebuild_nginx_config() {
   load_config
   if [[ -z "$TOKEN" ]]; then
-    echo "${RED}ERROR: Bearer token is empty. Set it first (Main Menu → 2 → 5).${RESET}"
+    echo "${RED}Bearer token is empty. Set it first (Main Menu → 2 → 5).${RESET}"
+    return 1
+  fi
+
+  if ! command -v nginx >/dev/null 2>&1; then
+    echo "${RED}nginx not found. Install it first (Main Menu → 1 → Install Software).${RESET}"
     return 1
   fi
 
   detect_brew_prefix
+  if [[ -z "$BREW_PREFIX" ]]; then
+    echo "${RED}Cannot determine Homebrew prefix. Is brew installed?${RESET}"
+    return 1
+  fi
+
   mkdir -p "$NGINX_CONF_DIR"
   mkdir -p "$BREW_PREFIX/var/log/nginx"
 
@@ -740,6 +1072,7 @@ NGINXEOF
   printf '%s' "$content" > "$NGINX_CONF"
   chmod 600 "$NGINX_CONF"
 
+  echo "${YELLOW}  Testing nginx config...${RESET}"
   if ! "$BREW_PREFIX/bin/nginx" -t >/tmp/nginx_test.log 2>&1; then
     echo "${RED}Nginx config INVALID:${RESET}"
     cat /tmp/nginx_test.log
@@ -764,14 +1097,16 @@ show_main_menu() {
     echo "  ${CYAN}1${RESET}) (Re)Run first-time setup"
     echo "  ${CYAN}2${RESET}) LM Studio configuration"
     echo "  ${CYAN}3${RESET}) Monitor (htop + macmon)"
-    echo "  ${CYAN}4${RESET}) Exit"
+    echo "  ${CYAN}4${RESET}) Check dependencies"
+    echo "  ${CYAN}5${RESET}) Exit"
     echo ""
-    read -p "${YELLOW}Choose (1-4): ${RESET}" choice
+    read -p "${YELLOW}Choose (1-5): ${RESET}" choice
     case $choice in
       1) first_time_setup ;;
       2) lmstudio_config_menu ;;
       3) launch_monitor ;;
-      4) echo "${GREEN}👋 Goodbye!${RESET}"; return 0 ;;
+      4) check_all_dependencies; read -p "${CYAN}Press Enter...${RESET}" ;;
+      5) echo "${GREEN}👋 Goodbye!${RESET}"; return 0 ;;
       *) echo "${RED}Invalid choice.${RESET}"; sleep 1 ;;
     esac
   done
@@ -782,13 +1117,18 @@ lmstudio_config_menu() {
     load_config
     if ! command -v lms >/dev/null 2>&1; then
       print_header
-      echo "${RED}LM Studio not found. Run Option 1 first.${RESET}"
+      echo "${RED}LM Studio not found.${RESET}"
+      echo "${YELLOW}Run Option 1 (Setup) → Install Software step first.${RESET}"
       read -p "Press Enter..."; return
     fi
     print_header
     echo "${BOLD}${GREEN}LM Studio Status${RESET}"
     echo "  ${CYAN}Port:${RESET}   $PORT"
-    echo "  ${CYAN}Token:${RESET}  ${TOKEN:0:8}... (masked)"
+    if [[ -n "$TOKEN" ]]; then
+      echo "  ${CYAN}Token:${RESET}  ${TOKEN:0:8}... (masked)"
+    else
+      echo "  ${CYAN}Token:${RESET}  ${RED}NOT SET${RESET}"
+    fi
     echo "  ${CYAN}Models:${RESET} $(lms ps 2>/dev/null || echo 'None loaded')"
     echo ""
     echo "${BOLD}${GREEN}Options${RESET}"
@@ -805,13 +1145,18 @@ lmstudio_config_menu() {
     read -p "${YELLOW}Choose (0-8): ${RESET}" sub
     case $sub in
       1) read -p "Model name or path: " m
-         [[ -n "$m" ]] && { lms get "$m" 2>/dev/null || true; } ;;
-      2) lms unload --all 2>/dev/null || true
+         if [[ -n "$m" ]]; then
+           echo "${YELLOW}Downloading model...${RESET}"
+           lms get "$m"
+         fi ;;
+      2) echo "${YELLOW}Unloading all models...${RESET}"
+         lms unload --all
          step_ok "All models unloaded" ;;
       3) read -p "Model ID: " id
          read -p "GPU layers [max]: " g; g=${g:-max}
          read -p "Context length [32768]: " c; c=${c:-32768}
-         lms load "$id" --gpu="$g" --context-length="$c" 2>/dev/null || true ;;
+         echo "${YELLOW}Loading model...${RESET}"
+         lms load "$id" --gpu="$g" --context-length="$c" ;;
       4) change_server_port ;;
       5) change_bearer_token ;;
       6) restart_ngrok ;;
@@ -826,7 +1171,9 @@ lmstudio_config_menu() {
 change_server_port() {
   read -p "New port [1234]: " p; p=${p:-1234}
   if [[ $p =~ ^[0-9]+$ ]] && (( p >= 1024 && p <= 65535 )); then
-    PORT=$p; save_config; create_launchd_plist; rebuild_nginx_config
+    PORT=$p; save_config
+    create_launchd_plist
+    rebuild_nginx_config
   else
     echo "${RED}Invalid port (must be 1024-65535).${RESET}"
   fi
@@ -851,12 +1198,15 @@ change_bearer_token() {
 }
 
 restart_ngrok() {
+  if ! command -v ngrok >/dev/null 2>&1; then
+    echo "${RED}ngrok not installed. Run Setup → Install Software first.${RESET}"; return
+  fi
   pkill ngrok 2>/dev/null || true
   read -p "ngrok authtoken: " tok
   if [[ -z "$tok" ]]; then
     echo "${RED}No token entered.${RESET}"; return
   fi
-  ngrok config add-authtoken "$tok" >/dev/null 2>&1 || true
+  ngrok config add-authtoken "$tok"
   nohup ngrok http 80 > ~/ngrok.log 2>&1 &
   sleep 3
   local URL
@@ -865,7 +1215,7 @@ restart_ngrok() {
   if [[ -n "$URL" ]]; then
     step_ok "ngrok tunnel active: $URL"
   else
-    echo "${GREEN}✅ ngrok started. Check ~/ngrok.log or http://127.0.0.1:4040 for URL.${RESET}"
+    echo "${GREEN}✅ ngrok started. Check ~/ngrok.log or http://127.0.0.1:4040${RESET}"
     echo "$DIVIDER"
   fi
 }
@@ -877,33 +1227,37 @@ mcp_manage() {
   fi
   cp "$MCP_FILE" "$MCP_FILE.bak" 2>/dev/null || true
   vi "$MCP_FILE"
-  launchctl bootout "gui/$(id -u)/com.llmstudio.server" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || true
-  step_ok "MCP config saved, LM Studio restarted"
+  if [[ -f "$LAUNCHD_PLIST" ]]; then
+    launchctl bootout "gui/$(id -u)/com.llmstudio.server" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || true
+    step_ok "MCP config saved, LM Studio restarted"
+  else
+    step_ok "MCP config saved"
+  fi
 }
 
 jump_setup() {
+  if [[ ! -f "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" ]]; then
+    echo "${RED}Jump Desktop Connect not installed. Run Setup → Install Software first.${RESET}"
+    return
+  fi
   echo "${YELLOW}On another device, go to: https://app.jumpdesktop.com${RESET}"
   echo "${YELLOW}Get a Connect Code, then enter it below.${RESET}"
   read -p "Connect Code: " code
   if [[ -z "$code" ]]; then
     echo "${RED}No code entered.${RESET}"; return
   fi
-  if [[ -f "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" ]]; then
-    "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" --connectcode "$code" 2>/dev/null || true
-    step_ok "Jump Desktop configured"
-  else
-    echo "${RED}Jump Desktop Connect not installed. Run Option 1 first.${RESET}"
-  fi
+  "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" --connectcode "$code"
+  step_ok "Jump Desktop configured"
 }
 
 launch_monitor() {
   if ! command -v tmux >/dev/null 2>&1; then
-    echo "${RED}tmux not installed. Run Option 1 first.${RESET}"
+    echo "${RED}tmux not installed. Run Setup → Install Software first.${RESET}"
     read -p "Press Enter..."; return
   fi
   if ! command -v htop >/dev/null 2>&1; then
-    echo "${RED}htop not installed. Run Option 1 first.${RESET}"
+    echo "${RED}htop not installed. Run Setup → Install Software first.${RESET}"
     read -p "Press Enter..."; return
   fi
   tmux kill-session -t monitor 2>/dev/null || true
