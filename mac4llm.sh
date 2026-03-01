@@ -1,6 +1,6 @@
 #!/bin/bash
-# server-menu.sh - COMPLETE 100% FINAL Mac Studio LLM Control Panel (March 01, 2026)
-# All 8 code-review issues fixed + minimal GUI + NO LAN access
+# server-menu.sh - COMPLETE 100% unabbreviated Mac Studio LLM Control Panel (March 01, 2026)
+# Numbered selection everywhere possible + minimal GUI + NO LAN access
 
 RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""; BOLD=""; RESET=""
 if [[ -t 1 ]]; then
@@ -57,7 +57,7 @@ print_header() {
   clear_screen
   echo "${BOX}"
   echo "${BLUE}║${RESET}     ${BOLD}${CYAN}🚀 Mac Studio LLM Server Control Panel${RESET}      ${BLUE}║${RESET}"
-  echo "${BLUE}║${RESET}   ${MAGENTA}Minimal GUI • NO LAN • All Fixes Applied${RESET}   ${BLUE}║${RESET}"
+  echo "${BLUE}║${RESET}   ${MAGENTA}Numbered Selection • Minimal GUI • NO LAN${RESET}   ${BLUE}║${RESET}"
   echo "${BOXB}"
   echo ""
 }
@@ -143,7 +143,7 @@ first_time_setup() {
   print_header
   echo "${BOLD}${YELLOW}Running FULL hardened setup with minimal GUI and NO LAN access...${RESET}"
 
-  # Hostname validation
+  # Hostname
   read -p "Hostname [macstudio-llm]: " HOSTNAME; HOSTNAME=${HOSTNAME:-macstudio-llm}
   if [[ $HOSTNAME =~ ^[a-zA-Z0-9-]+$ ]]; then
     sudo scutil --set HostName "$HOSTNAME"
@@ -155,10 +155,13 @@ first_time_setup() {
     echo "${RED}Invalid hostname.${RESET}"
   fi
 
-  # Static IP validation
-  echo "Network services:"
-  networksetup -listallnetworkservices
-  read -p "Ethernet service [Ethernet]: " SERVICE; SERVICE=${SERVICE:-Ethernet}
+  # Numbered network interface selection (your request)
+  echo "Network services (all interfaces shown):"
+  networksetup -listallnetworkservices | cat -n
+  read -p "Enter the NUMBER of the interface for static IP (default: 1): " NUM
+  [[ -z "$NUM" ]] && NUM=1
+  SERVICE=$(networksetup -listallnetworkservices | sed -n "${NUM}p")
+
   read -p "Static IP: " IP
   if [[ $IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
     read -p "Subnet [255.255.255.0]: " SUBNET; SUBNET=${SUBNET:-255.255.255.0}
@@ -166,7 +169,7 @@ first_time_setup() {
     if [[ $ROUTER =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
       sudo networksetup -setmanual "$SERVICE" "$IP" "$SUBNET" "$ROUTER"
       sudo networksetup -setdnsservers "$SERVICE" 8.8.8.8
-      echo "${GREEN}Static IP set.${RESET}"
+      echo "${GREEN}Static IP set on $SERVICE.${RESET}"
     else
       echo "${RED}Invalid router IP.${RESET}"
     fi
@@ -174,10 +177,16 @@ first_time_setup() {
     echo "${RED}Invalid IP.${RESET}"
   fi
 
-  read -p "Disable Wi-Fi? (y/n) [y]: " DW; [[ ${DW:-y} == "y" ]] && {
+  # Numbered Wi-Fi disable
+  echo "Disable Wi-Fi?"
+  echo "  1) Yes (recommended for secure server)"
+  echo "  2) No (keep enabled)"
+  read -p "Choice [1]: " DWNUM
+  [[ -z "$DWNUM" || "$DWNUM" == "1" ]] && {
     sudo networksetup -setairportpower Wi-Fi off 2>/dev/null || true
     sudo networksetup -setnetworkserviceenabled Wi-Fi off 2>/dev/null || true
-  }
+    echo "${GREEN}Wi-Fi disabled.${RESET}"
+  } || echo "${GREEN}Wi-Fi left enabled.${RESET}"
 
   # Hardening
   for svc in smbd AppleFileServer ftp netbiosd screensharing printd Siri mDNSResponder; do
@@ -198,9 +207,12 @@ first_time_setup() {
 
   configure_minimal_gui
 
-  # FileVault + auto-login
-  read -p "${RED}WARNING: Disable FileVault + enable auto-login? (y/n) [n]: ${RESET}" FV
-  if [[ $FV == "y" ]]; then
+  # Numbered FileVault prompt
+  echo "${RED}WARNING: Disable FileVault + enable auto-login?${RESET}"
+  echo "  1) Yes (convenient for headless server)"
+  echo "  2) No (keep full encryption)"
+  read -p "Choice [2]: " FVNUM
+  if [[ "$FVNUM" == "1" ]]; then
     if sudo fdesetup status | grep -q "FileVault is On" 2>/dev/null; then
       sudo fdesetup disable 2>/dev/null || true
       echo "${GREEN}FileVault disabled.${RESET}"
@@ -266,7 +278,6 @@ PF
 
   echo "${GREEN}Full setup complete with minimal GUI and NO direct LAN access.${RESET}"
   read -p "${CYAN}Press Enter to return...${RESET}"
-  # No call to show_main_menu — let the while-true loop continue
 }
 
 create_launchd_plist() {
