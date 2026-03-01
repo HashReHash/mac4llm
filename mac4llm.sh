@@ -1,6 +1,7 @@
 #!/bin/bash
-# mac4llm.sh — Mac Studio LLM Control Panel (March 2026)
+# mac4llm.sh — Mac Studio LLM Control Panel v0.31 (March 2026)
 # All bugs fixed. Every step: skip, retry, error recovery.
+# Triple auto-login + screen lock disable + kcpassword.
 
 # ── Colors (safe for non-interactive / cron) ──
 RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""; BOLD=""; RESET=""
@@ -15,6 +16,8 @@ if [[ -t 1 ]]; then
   RESET=$(tput sgr0 2>/dev/null) || RESET=""
 fi
 
+VERSION="v0.31"
+
 # ── Paths ──
 CONFIG_FILE="$HOME/.llm-server.conf"
 BREW_PREFIX=""
@@ -27,6 +30,7 @@ MINIMAL_GUI_PLIST="$HOME/Library/LaunchAgents/com.llm.minimal-gui.plist"
 ALERT_LOCK="/tmp/llm_alert.lock"
 LMS_PATH=""
 DIVIDER="${BLUE}──────────────────────────────────────────────────────────────${RESET}"
+STEP_ACTION=""
 
 detect_brew_prefix() {
   BREW_PREFIX=$(brew --prefix 2>/dev/null || echo "/opt/homebrew")
@@ -70,7 +74,7 @@ clear_screen() { clear 2>/dev/null || true; }
 print_header() {
   clear_screen
   echo "${BLUE}╔══════════════════════════════════════════════════════════════╗${RESET}"
-  echo "${BLUE}║  ${BOLD}${CYAN}Mac Studio LLM Server Control Panel${RESET}                       ${BLUE}║${RESET}"
+  echo "${BLUE}║  ${BOLD}${CYAN}Mac Studio LLM Server Control Panel ${VERSION}${RESET}              ${BLUE}║${RESET}"
   echo "${BLUE}║  ${MAGENTA}Follow steps to fine-tune your Mac to run LM Studio${RESET}       ${BLUE}║${RESET}"
   echo "${BLUE}╚══════════════════════════════════════════════════════════════╝${RESET}"
   echo ""
@@ -81,7 +85,7 @@ step_ok() {
   echo "$DIVIDER"
 }
 
-# Returns via global: STEP_ACTION = skip | retry | menu | exit
+# Sets global STEP_ACTION: skip | retry | menu
 step_fail() {
   echo "${RED}❌ $1${RESET}"
   echo ""
@@ -98,12 +102,6 @@ step_fail() {
     *) STEP_ACTION="skip" ;;
   esac
 }
-
-# Usage after step_fail:
-#   step_fail "msg"
-#   [[ $STEP_ACTION == "retry" ]] && continue
-#   [[ $STEP_ACTION == "menu" ]] && return
-#   break  # skip
 
 # ── Minimal GUI ──
 configure_minimal_gui() {
@@ -214,7 +212,6 @@ first_time_setup() {
     fi
     read -p "Hostname [macstudio-llm]: " HOSTNAME
     HOSTNAME=${HOSTNAME:-macstudio-llm}
-    # No leading/trailing hyphens, alphanumeric + hyphens only
     if [[ $HOSTNAME =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
       sudo scutil --set HostName "$HOSTNAME"
       sudo scutil --set LocalHostName "$HOSTNAME"
@@ -234,7 +231,6 @@ first_time_setup() {
   while true; do
     echo "${BOLD}${YELLOW}Step: Set static IP${RESET}"
 
-    # Parse interfaces (compatible with bash 3.2 — no mapfile)
     local IFACES=()
     while IFS= read -r line; do
       IFACES+=("$line")
@@ -303,7 +299,6 @@ first_time_setup() {
   read -p "${YELLOW}Choose [1]: ${RESET}" DWNUM
   case "${DWNUM:-1}" in
     1)
-      # Detect actual Wi-Fi device name from hardware ports
       local WIFI_DEV=""
       local in_wifi=false
       while IFS= read -r line; do
@@ -349,8 +344,14 @@ first_time_setup() {
       sudo pmset -a sleep 0 displaysleep 0 disksleep 0 autopoweroff 0
       sudo pmset -a autorestart 1
       sudo systemsetup -setremotelogin on
+      # Prevent screen lock from blocking SSH access
+      sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true
+      defaults write com.apple.screensaver askForPassword -int 0
+      defaults write com.apple.screensaver askForPasswordDelay -int 0
+      defaults -currentHost write com.apple.screensaver idleTime -int 0
+      sudo sysadminctl -screenLock off 2>/dev/null || true
     } >/dev/null 2>&1
-    step_ok "System hardened (services disabled, never-sleep, SSH on)"
+    step_ok "System hardened (services disabled, never-sleep, SSH on, screen lock off)"
   else
     echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
   fi
@@ -381,7 +382,6 @@ first_time_setup() {
       echo "${YELLOW}Your login password is required to disable FileVault.${RESET}"
       read -s -p "Login password: " FV_PASS; echo
 
-      # Create temp plist with restrictive permissions + trap cleanup
       local FV_PLIST
       FV_PLIST=$(mktemp /tmp/fv_XXXXXX.plist)
       chmod 600 "$FV_PLIST"
@@ -401,7 +401,9 @@ FVEOF
         step_ok "FileVault disabled (decryption continues in background)"
       else
         step_fail "FileVault disable failed — wrong password?"
-        [[ $STEP_ACTION == "menu" ]] && { rm -f "$FV_PLIST"; unset FV_PASS; return; }
+        if [[ $STEP_ACTION == "menu" ]]; then
+          rm -f "$FV_PLIST"; unset FV_PASS; trap - EXIT; return
+        fi
       fi
       rm -f "$FV_PLIST"
       unset FV_PASS
@@ -410,18 +412,46 @@ FVEOF
       echo "${GREEN}FileVault is already off.${RESET}"; echo "$DIVIDER"
     fi
 
-    # Auto-login
+    # Auto-login — triple method + screen lock disable
     echo "${BOLD}${YELLOW}Step: Enable auto-login${RESET}"
     read -s -p "Login password for auto-login: " AL_PASS; echo
     if [[ -n "$AL_PASS" ]]; then
-      # Primary method
-      sudo sysadminctl -autologin set -userName "$USER" -password "$AL_PASS" >/dev/null 2>&1
-      # Fallback: write loginwindow preference directly
+
+      # Method 1: sysadminctl (official Apple method)
+      sudo sysadminctl -autologin set -userName "$USER" -password "$AL_PASS" >/dev/null 2>&1 || true
+
+      # Method 2: Write loginwindow preference
       sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$USER" 2>/dev/null || true
-      # Disable login password requirement as additional fallback
-      sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false 2>/dev/null || true
+
+      # Method 3: Generate /etc/kcpassword (what macOS actually reads at boot)
+      python3 -c "
+import sys
+password = sys.argv[1].encode('utf-8')
+key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
+padded = password + b'\x00' * (12 - len(password) % 12)
+encoded = bytearray()
+for i, b in enumerate(padded):
+    encoded.append(b ^ key[i % len(key)])
+with open('/tmp/kcpassword', 'wb') as f:
+    f.write(bytes(encoded))
+" "$AL_PASS" 2>/dev/null
+
+      if [[ -f /tmp/kcpassword ]]; then
+        sudo cp /tmp/kcpassword /etc/kcpassword
+        sudo chmod 600 /etc/kcpassword
+        sudo chown root:wheel /etc/kcpassword
+        rm -f /tmp/kcpassword
+      fi
+
+      # Disable screen lock (prevents SSH "System is locked" after reboot)
+      sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true 2>/dev/null || true
+      defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+      defaults write com.apple.screensaver askForPasswordDelay -int 0 2>/dev/null || true
+      defaults -currentHost write com.apple.screensaver idleTime -int 0 2>/dev/null || true
+      sudo sysadminctl -screenLock off 2>/dev/null || true
+
       unset AL_PASS
-      step_ok "Auto-login configured for $USER"
+      step_ok "Auto-login configured for $USER (3 methods + screen lock disabled)"
     else
       echo "${RED}Empty password — skipping auto-login.${RESET}"; echo "$DIVIDER"
     fi
@@ -496,13 +526,11 @@ FVEOF
     if ! command -v brew >/dev/null 2>&1; then
       echo "${YELLOW}Installing Homebrew...${RESET}"
       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      # Add brew to current session PATH
       if [[ -f /opt/homebrew/bin/brew ]]; then
         eval "$(/opt/homebrew/bin/brew shellenv)"
       elif [[ -f /usr/local/bin/brew ]]; then
         eval "$(/usr/local/bin/brew shellenv)"
       fi
-      # Re-detect paths now that brew is available
       detect_brew_prefix
     fi
 
@@ -554,7 +582,7 @@ PF
     echo "${YELLOW}Skipped.${RESET}"; echo "$DIVIDER"
   fi
 
-  # ── STEP: Health cron ──
+  # ── Health monitoring cron ──
   local SCRIPT_PATH
   SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   local CRON_LINE="*/5 * * * * curl -sf http://127.0.0.1:80/health || $SCRIPT_PATH --alert 'LLM server unreachable'"
